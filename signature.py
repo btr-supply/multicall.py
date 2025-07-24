@@ -1,5 +1,5 @@
 # mypy: disable-error-code="attr-defined"
-from typing import Any, Dict, Final, List, Optional, Tuple, Union, final
+from typing import Any, Final, List, Optional, Tuple, Union, final
 
 import eth_abi.abi
 import eth_abi.decoding
@@ -7,8 +7,7 @@ import eth_abi.encoding
 import eth_hash.auto
 from eth_typing import Decodable, TypeStr
 
-
-_SIGNATURES: Final[Dict[str, "Signature"]] = {}
+from ...utils.decorators import cache
 
 TupleEncoder: Final = eth_abi.encoding.TupleEncoder
 TupleDecoder: Final = eth_abi.decoding.TupleDecoder
@@ -85,14 +84,10 @@ def parse_typestring(typestring: str) -> List[TypeStr]:
     parts.append(part)
     return parts
 
-
-def _get_signature(signature: str) -> "Signature":
-    try:
-        return _SIGNATURES[signature]
-    except KeyError:
-        instance = Signature(signature)
-        _SIGNATURES[signature] = instance
-        return instance
+@cache(ttl=3600, maxsize=1024)
+def get_signature(signature: str) -> "Signature":
+    instance = Signature(signature)
+    return instance
 
 
 @final

@@ -1,32 +1,21 @@
 # mypy: disable-error-code="attr-defined"
-from typing import Any, Callable, Final, Generator, Iterable, List, Optional, Tuple, Union, final
-
-import eth_retry
-from cchecksum import to_checksum_address
+from typing import Any, Callable, Final, Generator, Iterable, List, Optional, Tuple, Union
 from eth_typing import Address, ChecksumAddress, HexAddress, HexStr
 from eth_typing.abi import Decodable
 from web3 import Web3
 
-from multicall.constants import Network, w3
-from multicall.exceptions import StateOverrideNotSupported
-from multicall.loggers import setup_logger
-from multicall.signature import Signature, _get_signature
-from multicall.utils import (
-    _get_semaphore,
+from ...constants import ASYNC_SEMAPHORE
+from .signature import Signature, get_signature
+from .utils import (
     chain_id,
     get_async_w3,
     state_override_supported,
 )
 
-logger: Final = setup_logger(__name__)
-log_debug: Final = logger.debug
-
 AnyAddress = Union[str, Address, ChecksumAddress, HexAddress]
 
 
-@final
 class Call:
-
     __slots__ = (
         "target",
         "returns",
@@ -43,27 +32,25 @@ class Call:
     def __init__(
         self,
         target: AnyAddress,
-        # 'funcName(dtype)(dtype)' or ['funcName(dtype)(dtype)', input0, input1, ...]
         function: Union[str, List[Union[str, Any]]],
         returns: Optional[Iterable[Tuple[str, Callable]]] = None,
         block_id: Optional[int] = None,
         gas_limit: Optional[int] = None,
         state_override_code: Optional[HexStr] = None,
-        # This needs to be None in order to use process_pool_executor
         _w3: Optional[Web3] = None,
         origin: Optional[AnyAddress] = None,
     ) -> None:
-        self.target: Final = to_checksum_address(target)
+        self.target: Final = Web3.to_checksum_address(target)
         self.returns: Final = returns
         self.block_id: Final = block_id
         self.gas_limit: Final = gas_limit
         self.state_override_code: Final = state_override_code
         self.w3: Final = _w3
-        self.origin: Final = to_checksum_address(origin) if origin else None
+        self.origin: Final = Web3.to_checksum_address(origin) if origin else None
 
         self.function: Final = function[0] if isinstance(function, list) else function
         self.args: Final = function[1:] if isinstance(function, list) else None
-        self.signature: Final = _get_signature(self.function)
+        self.signature: Final = get_signature(self.function)
 
     def __repr__(self) -> str:
         string = f"<Call {self.function} on {self.target[:8]}"
@@ -94,9 +81,9 @@ class Call:
             try:
                 decoded = signature.decode_data(output)
             except:
-                success, decoded = False, [None] * (len(returns) if returns else 1)  # type: ignore
+                success, decoded = False, [None] * (len(returns) if returns else 1)
         else:
-            decoded = [None] * (len(returns) if returns else 1)  # type: ignore
+            decoded = [None] * (len(returns) if returns else 1)
 
         if returns:
             return {
@@ -106,7 +93,6 @@ class Call:
         else:
             return decoded if len(decoded) > 1 else decoded[0]
 
-    @eth_retry.auto_retry
     def __call__(
         self,
         args: Optional[Any] = None,
@@ -114,8 +100,12 @@ class Call:
         *,
         block_id: Optional[int] = None,
     ) -> Any:
-        _w3 = self.w3 or _w3 or w3
-        args = prep_args(
+        w3 = self.w3 or _w3
+        if w3 is None:
+            from web3.auto import w3 as default_w3
+            w3 = default_w3
+
+        call_args = prep_args(
             self.target,
             self.signature,
             args or self.args,
@@ -124,18 +114,16 @@ class Call:
             self.gas_limit,
             self.state_override_code,
         )
-        result = Call.decode_output(
-            _w3.eth.call(*args),
+        output = w3.eth.call(*call_args)
+        return Call.decode_output(
+            output,
             self.signature,
             self.returns,
         )
-        log_debug("%s returned %s", self, result)
-        return result
 
     def __await__(self) -> Generator[Any, Any, Any]:
         return self.coroutine().__await__()
 
-    @eth_retry.auto_retry
     async def coroutine(
         self,
         args: Optional[Any] = None,
@@ -143,15 +131,16 @@ class Call:
         *,
         block_id: Optional[int] = None,
     ) -> Any:
-        _w3 = self.w3 or _w3 or w3
+        w3 = self.w3 or _w3
+        if w3 is None:
+            from web3.auto import w3 as default_w3
+            w3 = default_w3
 
-        if self.state_override_code and not state_override_supported(_w3):
-            raise StateOverrideNotSupported(
-                f"State override is not supported on {Network(chain_id(_w3)).__repr__()[1:-1]}."  # type: ignore [arg-type]
-            )
+        if self.state_override_code and not state_override_supported(w3):
+            raise ValueError(f"State override is not supported on chain {chain_id(w3)}.")
 
-        async with _get_semaphore():
-            output = await get_async_w3(_w3).eth.call(  # type: ignore [misc]
+        async with ASYNC_SEMAPHORE:
+            output = await get_async_w3(w3).eth.call(
                 *prep_args(
                     self.target,
                     self.signature,
@@ -163,9 +152,7 @@ class Call:
                 )
             )
 
-        result = Call.decode_output(output, self.signature, self.returns)
-        log_debug("%s returned %s", self, result)
-        return result
+        return Call.decode_output(output, self.signature, self.returns)
 
 
 def prep_args(
@@ -181,15 +168,21 @@ def prep_args(
     calldata = signature.encode_data(args)
 
     call_dict = {"to": target, "data": calldata}
-    prepared_args = [call_dict, block_id]
+    prepared_args: List[Any] = [call_dict]
+
+    if block_id is not None:
+        prepared_args.append(block_id)
 
     if origin:
         call_dict["from"] = origin
 
     if gas_limit:
-        call_dict["gas"] = gas_limit  # type: ignore [assignment]
+        call_dict["gas"] = gas_limit
 
     if state_override_code:
-        prepared_args.append({target: {"code": state_override_code}})  # type: ignore [dict-item]
+        if block_id is None:
+            # Add a default block identifier if none is present, as it's required for state override
+            prepared_args.append('latest')
+        prepared_args.append({target: {"code": state_override_code}})
 
     return prepared_args
